@@ -1,8 +1,13 @@
 import argparse, os
 import cv2
+import json
 import torch
+import torch.nn as nn
 import numpy as np
 from omegaconf import OmegaConf
+from collections import defaultdict
+from typing import DefaultDict, Tuple, List
+from functools import partial
 from PIL import Image
 from tqdm import tqdm, trange
 from itertools import islice
@@ -19,6 +24,7 @@ from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
 torch.set_grad_enabled(False)
+
 
 def chunk(it, size):
     it = iter(it)
@@ -199,6 +205,11 @@ def parse_args():
         action='store_true',
         help="Use bfloat16",
     )
+    parser.add_argument(
+        "--save-hidden-states",
+        action="store_true",
+        help="Use a forward hook to save hidden states"
+    )
     opt = parser.parse_args()
     return opt
 
@@ -232,6 +243,65 @@ def main(opt):
     wm = "SDV2"
     wm_encoder = WatermarkEncoder()
     wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+
+    if opt.save_hidden_states:  # save the forwards by registering some forward hooks
+        layer_to_save = 'model.diffusion_model.middle_block.1'  # spatial transformer at the heart of the SD unet
+
+        def save_prompt_encodings(
+                activations: DefaultDict,
+                name: str,
+                module: nn.Module,
+                inp: Tuple,
+                out: torch.Tensor,
+        ) -> None:
+            activation = out.detach().cpu()
+            activation_data = {
+                'activation': activation.tolist(),
+                'prompt': opt.prompt,
+            }
+            activations[name].append(activation_data)
+
+            # too slow
+            # savepath = os.path.join('data', 'prompt_hidden_states', 'prompt_hidden_states.json')
+            # if os.path.exists(savepath):
+            #     with open(savepath, 'r') as f:
+            #         all_activations = json.load(f)
+            # else:
+            #     all_activations = []
+
+            # all_activations.append(activation_data)
+
+            # with open(savepath, 'w') as f:
+            #     json.dump(all_activations, f)
+
+        def register_hidden_state_hook(
+                model: nn.Module,
+        ) -> DefaultDict[List, torch.Tensor]:
+            activations_dict = defaultdict(list)
+
+            for name, module in model.named_modules():
+                if name == layer_to_save:
+                    module.register_forward_hook(
+                        partial(save_prompt_encodings, activations_dict, name),
+                    )
+            return activations_dict
+
+        # def store_prompt(
+        #         module: nn.Module,
+        #         inp: Tuple,
+        # ):
+        #     for name, child_module in module.named_modules():
+        #         if name == layer_to_save:
+        #             child_module.stored_inputs = inp
+        #
+        # def register_store_prompt_forward_pre_hook(
+        #         model: nn.Module,
+        # ):
+        #     model.register_forward_pre_hook(store_prompt)
+
+        # register model hook and pre-hook
+        # register_store_prompt_forward_pre_hook(model)
+        activation_dict = register_hidden_state_hook(model)
 
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
@@ -345,14 +415,14 @@ def main(opt):
                     c = model.get_learned_conditioning(prompts)
                     shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
                     samples, _ = sampler.sample(S=opt.steps,
-                                                     conditioning=c,
-                                                     batch_size=opt.n_samples,
-                                                     shape=shape,
-                                                     verbose=False,
-                                                     unconditional_guidance_scale=opt.scale,
-                                                     unconditional_conditioning=uc,
-                                                     eta=opt.ddim_eta,
-                                                     x_T=start_code)
+                                                conditioning=c,
+                                                batch_size=opt.n_samples,
+                                                shape=shape,
+                                                verbose=False,
+                                                unconditional_guidance_scale=opt.scale,
+                                                unconditional_conditioning=uc,
+                                                eta=opt.ddim_eta,
+                                                x_T=start_code)
 
                     x_samples = model.decode_first_stage(samples)
                     x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
@@ -381,6 +451,17 @@ def main(opt):
 
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")
+
+    if opt.save_hidden_states:
+        print('Saving activation dict')
+        save_path = os.path.join('data', 'prompt_hidden_states', 'dumped_acts.pt')
+
+        if os.path.exists(save_path):
+            all_acts = torch.load(save_path)
+        else:
+            all_acts = []
+        all_acts.append(activation_dict)
+        torch.save(all_acts, save_path)
 
 
 if __name__ == "__main__":

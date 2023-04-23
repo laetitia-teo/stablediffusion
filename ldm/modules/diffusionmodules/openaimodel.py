@@ -117,6 +117,7 @@ class Upsample(nn.Module):
             x = self.conv(x)
         return x
 
+
 class TransposedUpsample(nn.Module):
     'Learned 2x upsampling without padding'
     def __init__(self, channels, out_channels=None, ks=5):
@@ -249,7 +250,6 @@ class ResBlock(TimestepBlock):
         return checkpoint(
             self._forward, (x, emb), self.parameters(), self.use_checkpoint
         )
-
 
     def _forward(self, x, emb):
         if self.updown:
